@@ -349,10 +349,19 @@ function logit(p) {
     return Math.log(p / (1 - p));
 }
 
-function isotonicFit(points) {
+// SAT is fit with monotonic isotonic regression, but each SAT block is
+// partially pooled toward the school's overall acceptance rate. This prevents
+// one or two unusual applicants at an extreme SAT score from producing a
+// near-0% or near-100% estimate.
+function isotonicFit(points, priorRate = 0.5) {
     const sorted = points
         .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y))
         .sort((a,b) => a.x - b.x);
+
+    if (!sorted.length) return [];
+
+    const safePriorRate = clamp(priorRate, 0.03, 0.97);
+    const PRIOR_STRENGTH = 20;
 
     const blocks = [];
 
@@ -385,7 +394,55 @@ function isotonicFit(points) {
         }
     }
 
-    return blocks.map(b => ({
+    // Shrink each fitted block toward the school's overall acceptance rate.
+    // A block with lots of historical applicants is affected less than a block
+    // supported by only one or two applicants.
+    const smoothed = blocks.map(b => {
+        const empirical = b.sum / b.weight;
+        const effectiveWeight = b.weight / (b.weight + PRIOR_STRENGTH);
+        const value = safePriorRate +
+            effectiveWeight * (empirical - safePriorRate);
+
+        return {
+            lo: b.lo,
+            hi: b.hi,
+            value: value,
+            weight: b.weight
+        };
+    });
+
+    // Re-enforce monotonicity after smoothing.
+    const finalBlocks = [];
+    for (const b of smoothed) {
+        finalBlocks.push({
+            lo: b.lo,
+            hi: b.hi,
+            sum: b.value * b.weight,
+            weight: b.weight
+        });
+
+        while (finalBlocks.length >= 2) {
+            const a = finalBlocks[finalBlocks.length - 2];
+            const b = finalBlocks[finalBlocks.length - 1];
+            const av = a.sum / a.weight;
+            const bv = b.sum / b.weight;
+
+            if (av <= bv) break;
+
+            finalBlocks.pop();
+            finalBlocks.pop();
+
+            const weight = a.weight + b.weight;
+            finalBlocks.push({
+                lo: a.lo,
+                hi: b.hi,
+                sum: a.sum + b.sum,
+                weight
+            });
+        }
+    }
+
+    return finalBlocks.map(b => ({
         lo: b.lo,
         hi: b.hi,
         value: b.sum / b.weight,
@@ -491,11 +548,16 @@ function logisticGpaPredict(model, x) {
 function fitFeature(records, field) {
     if (field === 'gpa') return logisticGpaFit(records);
 
-    // Keep the SAT relationship monotonic as before.
+    // Keep the SAT relationship monotonic, while shrinking sparse SAT-score
+    // blocks toward the school's overall acceptance rate.
+    const acceptedRate =
+        records.filter(r => r.outcome === 'accepted').length / records.length;
+
     return isotonicFit(
         makeBinaryTarget(
             records.map(r => ({ x: r[field], outcome: r.outcome }))
-        )
+        ),
+        acceptedRate
     );
 }
 
